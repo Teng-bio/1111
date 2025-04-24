@@ -1039,7 +1039,8 @@ class Record:
 
         return regions_added
 
-    def extend_location(self, location: Location, distance: int) -> Location:
+    def extend_location(self, location: Location, distance: int, connect_result: bool = True,
+                        ) -> Location:
         """ Constructs a new location which covers the given distance from the
             given location, capped at record limits unless the record is circular,
             in which case it wraps around.
@@ -1047,96 +1048,42 @@ class Record:
             Arguments:
                 location: the location to create an extended version of
                 distance: the distance to extend the location, applies in both directions
+                connect_result: if True, the resulting location will have all sub-locations
+                                connected (e.g. introns will be excluded)
 
             Returns:
                 a new location, covering the requested area(s)
         """
-
         parts = list(location.parts)  # the original location must not be changed
+        initial_operator = location.operator if len(parts) > 1 else "join"
         maximum = len(self)
-        if location.strand == -1:
-            parts.reverse()
 
-        # catch any case where both sides extend past the edges *and then overlap*
-        # in which case a simple bounding to the record edges is enough
-        n0 = parts[0].start
-        n1 = parts[-1].end
-        ns = n0 - distance
-        ne = n1 + distance
-        if self.is_circular() and ns < 0 and ns + maximum <= ne:
-            parts[0] = FeatureLocation(0, parts[0].end, location.strand)
-            parts[-1] = FeatureLocation(parts[-1].start, maximum, location.strand)
-            # merge any parts that now overlap with each other
-            if ns < 0:
-                upper = FeatureLocation(ns + maximum, maximum, location.strand)
-                merged = False
-                while parts and locations_overlap(parts[-1], upper):
-                    merged = True
-                    upper = FeatureLocation(min(parts[-1].start, upper.start), maximum, location.strand)
-                    parts.pop()
-                if merged:
-                    parts = [upper] + parts
-            if ne > maximum:
-                lower = FeatureLocation(0, ne % maximum, location.strand)
-                merged = False
-                while parts and locations_overlap(parts[0], lower):
-                    merged = True
-                    lower = FeatureLocation(0, max(parts[0].end, lower.end), location.strand)
-                    parts.pop(0)
-                if merged:
-                    parts.append(lower)
+        def bounded(start: int, end: int, strand: int) -> FeatureLocation:
+            return FeatureLocation(max(0, start), min(end, maximum), strand)
 
-            # if there's only one part remaining, it should be reduced to a whole-record location
-            if len(parts) == 1:
-                assert parts == [FeatureLocation(0, maximum, location.strand)], parts
-                return parts[0]
-
+        # hard bounds are easy to manage
+        if not self.is_circular():
+            if connect_result or len(parts) == 1:  # both result in a single section
+                new = self.connect_locations(parts)
+                return bounded(new.start - distance, new.end + distance, location.strand)
+            # the remainder are multi-part, but still not extending out of the record
             if location.strand == -1:
-                parts.reverse()
-            if len(location.parts) > 1:
-                return CompoundLocation(parts, operator=location.operator)
-            return CompoundLocation(parts)
+                parts[0] = bounded(parts[0].start, parts[0].end + distance, parts[0].strand)
+                parts[-1] = bounded(parts[-1].start - distance, parts[-1].end, parts[-1].strand)
+            else:
+                parts[0] = bounded(parts[0].start - distance, parts[0].end, parts[0].strand)
+                parts[-1] = bounded(parts[-1].start, parts[-1].end + distance, parts[-1].strand)
+            return CompoundLocation(parts, operator=initial_operator)
 
-        # if the wrap around goes so far as to overlap other parts, merge them
-        while len(parts) > 1 and locations_overlap(parts[0], parts[-1]):
-            first = parts[0]
-            second = parts[-1]
-            parts[0] = FeatureLocation(min(first.start, second.start), max(first.end, second.end),
-                                       first.strand if first.strand == second.strand else 0)
-            parts.pop()
+        # withs soft bounds and connecting, at least each of the pre- and post-origin components can be merged first
+        if connect_result:
+            parts = self.connect_locations([location]).parts
+            # connect will convert cross-origin locations to the forward strand
+            # fix that up if necessary, but leave th
+            if location.strand == -1:
+                parts = [FeatureLocation(p.start, p.end, -1) for p in reversed(parts)]
 
-        start_part = parts[0]
-        if start_part.start - distance < 0 and self.is_circular():
-            parts[0] = FeatureLocation(0, start_part.end, parts[0].strand)
-            parts.insert(0, FeatureLocation(min(maximum + (start_part.start - distance), maximum),
-                                            maximum, start_part.strand))
-        else:
-            parts[0] = FeatureLocation(max(0, start_part.start - distance), start_part.end, start_part.strand)
-
-        end_part = parts[-1]
-        if end_part.end + distance > maximum and self.is_circular():
-            parts[-1] = FeatureLocation(end_part.start, maximum, end_part.strand)
-            parts.append(FeatureLocation(0, min(end_part.end + distance - maximum, maximum), end_part.strand))
-        else:
-            parts[-1] = FeatureLocation(end_part.start, min(end_part.end + distance, maximum), end_part.strand)
-
-        # if the wrap around goes so far as to overlap other parts, merge them
-        while len(parts) > 1 and locations_overlap(parts[0], parts[-1]):
-            first = parts[0]
-            second = parts[-1]
-            parts[0] = FeatureLocation(min(first.start, second.start), max(first.end, second.end),
-                                       first.strand if first.strand == second.strand else 0)
-            parts.pop()
-
-        if len(parts) == 1:
-            return parts[0]
-        if location.strand == -1:
-            parts.reverse()
-        # reuse the operator of the original, if it was compound to start with
-        if len(location.parts) > 1:
-            return CompoundLocation(parts, operator=location.operator)
-        # otherwise use the default
-        return CompoundLocation(parts)
+        return _extend_cross_origin(location, parts, distance, maximum, initial_operator)
 
     def get_distance_between_features(self, first: Feature, second: Feature) -> int:
         """ Returns the shortest distance between the two given features, crossing
@@ -1231,6 +1178,93 @@ def _calculate_crc32(string: str) -> str:
     """
     checksum = crc32(string.encode("utf-8"))
     return f"{checksum:x}"
+
+
+def _extend_cross_origin(location: Location, parts: list[FeatureLocation], distance: int,
+                         maximum: int, operator: str,
+                         ) -> Location:
+
+    strand = parts[0].strand
+
+    def bounded(start: int, end: int, strand: int) -> FeatureLocation:
+        return FeatureLocation(max(0, start), min(end, maximum), strand)
+
+    if location.strand == -1:
+        parts.reverse()
+
+    # catch any case where both sides extend past the edges *and then overlap*
+    # in which case a simple bounding to the record edges is enough
+    n0 = parts[0].start
+    n1 = parts[-1].end
+    ns = n0 - distance
+    ne = n1 + distance
+    if ns < 0 and ns + maximum <= ne:
+        parts[0] = FeatureLocation(0, parts[0].end, strand)
+        parts[-1] = FeatureLocation(parts[-1].start, maximum, strand)
+        # merge any parts that now overlap with each other
+        if ns < 0:
+            upper = FeatureLocation(ns + maximum, maximum, strand)
+            merged = False
+            while parts and locations_overlap(parts[-1], upper):
+                merged = True
+                upper = FeatureLocation(min(parts[-1].start, upper.start), maximum, strand)
+                parts.pop()
+            if merged:
+                parts = [upper] + parts
+        if ne > maximum:
+            lower = FeatureLocation(0, ne % maximum, strand)
+            merged = False
+            while parts and locations_overlap(parts[0], lower):
+                merged = True
+                lower = FeatureLocation(0, max(parts[0].end, lower.end), strand)
+                parts.pop(0)
+            if merged:
+                parts.append(lower)
+
+        # if there's only one part remaining, it should be reduced to a whole-record location
+        if len(parts) == 1:
+            assert parts == [FeatureLocation(0, maximum, strand)], parts
+            return parts[0]
+
+        if strand == -1:
+            parts.reverse()
+        return CompoundLocation(parts, operator=operator)
+
+    # if the wrap around goes so far as to overlap other parts, merge them
+    while len(parts) > 1 and locations_overlap(parts[0], parts[-1]):
+        first = parts[0]
+        second = parts[-1]
+        parts[0] = FeatureLocation(min(first.start, second.start), max(first.end, second.end),
+                                   first.strand if first.strand == second.strand else 0)
+        parts.pop()
+
+    start_part = parts[0]
+    if start_part.start - distance < 0:
+        parts[0] = FeatureLocation(0, start_part.end, parts[0].strand)
+        parts.insert(0, bounded(maximum + (start_part.start - distance), maximum, start_part.strand))
+    else:
+        parts[0] = bounded(start_part.start - distance, start_part.end, start_part.strand)
+
+    end_part = parts[-1]
+    if end_part.end + distance > maximum:
+        parts[-1] = FeatureLocation(end_part.start, maximum, end_part.strand)
+        parts.append(bounded(0, end_part.end + distance - maximum, end_part.strand))
+    else:
+        parts[-1] = bounded(end_part.start, end_part.end + distance, end_part.strand)
+
+    # if the wrap around goes so far as to overlap other parts, merge them
+    while len(parts) > 1 and locations_overlap(parts[0], parts[-1]):
+        first = parts[0]
+        second = parts[-1]
+        parts[0] = FeatureLocation(min(first.start, second.start), max(first.end, second.end),
+                                   first.strand if first.strand == second.strand else 0)
+        parts.pop()
+
+    if len(parts) == 1:
+        return parts[0]
+    if strand == -1:
+        parts.reverse()
+    return CompoundLocation(parts, operator=operator)
 
 
 def _location_checksum(feature: Feature) -> str:
